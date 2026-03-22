@@ -1,36 +1,27 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { getSocket } from '../utils/socket';
-import { createPeerConnection, createAnswer, addIceCandidate } from '../utils/webrtc';
+import { createPeerConnection, createAnswer, createIceCandidateQueue } from '../utils/webrtc';
 import { useSessionStore } from '../store/sessionStore';
 
-// Throttle helper (using ref to avoid re-render)
 function throttle(fn, ms) {
   let last = 0;
   return (...args) => {
     const now = Date.now();
-    if (now - last >= ms) {
-      last = now;
-      fn(...args);
-    }
+    if (now - last >= ms) { last = now; fn(...args); }
   };
 }
 
 export function useViewer({ remoteVideoRef, controlLayerRef }) {
   const pc = useRef(null);
+  const iceQueue = useRef(null);
   const { setStreaming, setControlEnabled, removeViewer, addViewer, controlEnabled } = useSessionStore();
-  const lastPingRef = useRef(null);
 
-  // Control event sender
   const sendControlEvent = useCallback((data) => {
-    const socket = getSocket();
-    socket.emit('control-event', data);
+    getSocket().emit('control-event', data);
   }, []);
 
-  const throttledMouseMove = useRef(
-    throttle((data) => sendControlEvent(data), 40)
-  ).current;
+  const throttledMouseMove = useRef(throttle((data) => sendControlEvent(data), 40)).current;
 
-  // Attach control listeners to the video/overlay element
   const attachControlListeners = useCallback(() => {
     const layer = controlLayerRef?.current;
     if (!layer) return;
@@ -38,30 +29,16 @@ export function useViewer({ remoteVideoRef, controlLayerRef }) {
     const getCoords = (e) => {
       const rect = layer.getBoundingClientRect();
       return {
-        x: Math.round(e.clientX - rect.left + window.scrollX),
-        y: Math.round(e.clientY - rect.top + window.scrollY),
+        x: Math.round(e.clientX - rect.left),
+        y: Math.round(e.clientY - rect.top),
       };
     };
 
-    const onMouseMove = (e) => {
-      const { x, y } = getCoords(e);
-      throttledMouseMove({ type: 'mousemove', x, y });
-    };
-    const onMouseDown = (e) => {
-      const { x, y } = getCoords(e);
-      sendControlEvent({ type: 'mousedown', x, y, button: e.button });
-    };
-    const onMouseUp = (e) => {
-      const { x, y } = getCoords(e);
-      sendControlEvent({ type: 'mouseup', x, y, button: e.button });
-    };
-    const onKeyDown = (e) => {
-      e.preventDefault();
-      sendControlEvent({ type: 'keydown', key: e.key, code: e.code, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey });
-    };
-    const onKeyUp = (e) => {
-      sendControlEvent({ type: 'keyup', key: e.key, code: e.code, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey });
-    };
+    const onMouseMove = (e) => throttledMouseMove({ type: 'mousemove', ...getCoords(e) });
+    const onMouseDown = (e) => sendControlEvent({ type: 'mousedown', ...getCoords(e), button: e.button });
+    const onMouseUp   = (e) => sendControlEvent({ type: 'mouseup',   ...getCoords(e), button: e.button });
+    const onKeyDown   = (e) => { e.preventDefault(); sendControlEvent({ type: 'keydown', key: e.key, code: e.code, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey }); };
+    const onKeyUp     = (e) => sendControlEvent({ type: 'keyup', key: e.key, code: e.code, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey, altKey: e.altKey, metaKey: e.metaKey });
 
     layer.addEventListener('mousemove', onMouseMove);
     layer.addEventListener('mousedown', onMouseDown);
@@ -82,14 +59,44 @@ export function useViewer({ remoteVideoRef, controlLayerRef }) {
   useEffect(() => {
     const socket = getSocket();
 
-    // WebRTC: receive offer from host
+    // ── Receive WebRTC offer from host ──────────────────────────────────
     socket.on('webrtc-offer', async ({ fromId, offer }) => {
+      console.log('[Viewer] Got offer from', fromId);
+
+      // Close stale connection if any
+      if (pc.current) { pc.current.close(); pc.current = null; }
+
       const conn = createPeerConnection();
       pc.current = conn;
 
+      // Create ICE candidate queue BEFORE setting remote description
+      const icq = createIceCandidateQueue(conn);
+      iceQueue.current = icq;
+
+      // ── Track handler — try both event.streams and addtrack on stream ──
       conn.ontrack = (event) => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
+        console.log('[Viewer] ontrack fired, streams:', event.streams.length, 'track kind:', event.track.kind);
+        const stream = event.streams[0];
+        if (stream && remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = stream;
+          // Chrome sometimes needs a play() call after srcObject assignment
+          remoteVideoRef.current.play().catch(() => {
+            // Autoplay blocked — unmute and try again (user gesture fallback)
+            console.warn('[Viewer] Autoplay blocked, trying muted play');
+            remoteVideoRef.current.muted = true;
+            remoteVideoRef.current.play().catch(console.error);
+          });
+          setStreaming(true);
+        } else if (!stream) {
+          // Fallback: build MediaStream from tracks manually
+          console.log('[Viewer] No stream in ontrack, building manually');
+          let ms = remoteVideoRef.current?.srcObject;
+          if (!(ms instanceof MediaStream)) {
+            ms = new MediaStream();
+            if (remoteVideoRef.current) remoteVideoRef.current.srcObject = ms;
+          }
+          ms.addTrack(event.track);
+          remoteVideoRef.current?.play().catch(console.error);
           setStreaming(true);
         }
       };
@@ -98,24 +105,41 @@ export function useViewer({ remoteVideoRef, controlLayerRef }) {
         if (candidate) socket.emit('ice-candidate', { targetId: fromId, candidate });
       };
 
-      conn.onconnectionstatechange = () => {
-        if (['disconnected', 'failed', 'closed'].includes(conn.connectionState)) {
+      conn.oniceconnectionstatechange = () => {
+        console.log('[Viewer] ICE state:', conn.iceConnectionState);
+        if (conn.iceConnectionState === 'connected' || conn.iceConnectionState === 'completed') {
+          setStreaming(true);
+        }
+        if (['disconnected', 'failed', 'closed'].includes(conn.iceConnectionState)) {
           setStreaming(false);
         }
       };
 
+      conn.onconnectionstatechange = () => {
+        console.log('[Viewer] Connection state:', conn.connectionState);
+      };
+
+      // Create answer — this sets remoteDescription, then flush queued ICE
       const answer = await createAnswer(conn, offer);
+      await icq.flush(); // flush any ICE candidates that arrived before this
       socket.emit('webrtc-answer', { targetId: fromId, answer });
+      console.log('[Viewer] Sent answer to', fromId);
     });
 
+    // ── ICE candidates from host ────────────────────────────────────────
     socket.on('ice-candidate', async ({ fromId, candidate }) => {
-      if (pc.current) await addIceCandidate(pc.current, candidate);
+      console.log('[Viewer] Got ICE candidate from', fromId);
+      if (iceQueue.current) {
+        await iceQueue.current.add(candidate);
+      } else if (pc.current?.remoteDescription) {
+        try { await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); }
+        catch (e) { console.warn('ICE error:', e); }
+      }
     });
 
     socket.on('user-joined', (user) => addViewer(user));
     socket.on('user-left', ({ id }) => removeViewer(id));
     socket.on('control-toggled', ({ enabled }) => setControlEnabled(enabled));
-
     socket.on('host-left', () => {
       setStreaming(false);
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
@@ -132,11 +156,9 @@ export function useViewer({ remoteVideoRef, controlLayerRef }) {
     };
   }, [remoteVideoRef, setStreaming, setControlEnabled, addViewer, removeViewer]);
 
-  // Attach/detach control listeners based on controlEnabled
   useEffect(() => {
     if (!controlEnabled) return;
-    const cleanup = attachControlListeners();
-    return cleanup;
+    return attachControlListeners();
   }, [controlEnabled, attachControlListeners]);
 
   return { sendControlEvent };

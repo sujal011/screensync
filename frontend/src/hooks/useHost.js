@@ -1,10 +1,10 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { getSocket } from '../utils/socket';
-import { createPeerConnection, createOffer, handleAnswer, addIceCandidate } from '../utils/webrtc';
+import { createPeerConnection, createOffer, handleAnswer, createIceCandidateQueue } from '../utils/webrtc';
 import { useSessionStore } from '../store/sessionStore';
 
 export function useHost({ localVideoRef }) {
-  const peerConnections = useRef({});
+  const peerConnections = useRef({});  // viewerId -> { pc, iceQueue }
   const localStream = useRef(null);
   const { setStreaming, setSharingScreen, addViewer, removeViewer, setControlEnabled } = useSessionStore();
 
@@ -32,7 +32,7 @@ export function useHost({ localVideoRef }) {
       localStream.current = null;
     }
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
-    Object.values(peerConnections.current).forEach((pc) => pc.close());
+    Object.values(peerConnections.current).forEach(({ pc }) => pc.close());
     peerConnections.current = {};
     setSharingScreen(false);
     setStreaming(false);
@@ -40,25 +40,47 @@ export function useHost({ localVideoRef }) {
 
   const createConnectionForViewer = useCallback(async (viewerId) => {
     const socket = getSocket();
-    const pc = createPeerConnection();
-    peerConnections.current[viewerId] = pc;
 
+    // Close any stale connection for this viewer
+    if (peerConnections.current[viewerId]) {
+      peerConnections.current[viewerId].pc.close();
+    }
+
+    const pc = createPeerConnection();
+    const iceQueue = createIceCandidateQueue(pc);
+    peerConnections.current[viewerId] = { pc, iceQueue };
+
+    // ── Add all local stream tracks BEFORE creating offer ──────────────
     if (localStream.current) {
-      localStream.current.getTracks().forEach((track) => pc.addTrack(track, localStream.current));
+      console.log('[Host] Adding', localStream.current.getTracks().length, 'tracks to PC for', viewerId);
+      localStream.current.getTracks().forEach((track) => {
+        pc.addTrack(track, localStream.current);
+      });
+    } else {
+      console.warn('[Host] No local stream when creating connection for', viewerId);
     }
 
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) socket.emit('ice-candidate', { targetId: viewerId, candidate });
     };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log('[Host] ICE state for', viewerId, ':', pc.iceConnectionState);
+    };
+
     pc.onconnectionstatechange = () => {
+      console.log('[Host] Conn state for', viewerId, ':', pc.connectionState);
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
         pc.close();
         delete peerConnections.current[viewerId];
       }
     };
 
+    // Create offer and send — tracks are already added so SDP includes media
     const offer = await createOffer(pc);
+    console.log('[Host] Sending offer to viewer', viewerId);
     socket.emit('webrtc-offer', { targetId: viewerId, offer });
+
     return pc;
   }, []);
 
@@ -80,25 +102,17 @@ export function useHost({ localVideoRef }) {
       el.dispatchEvent(new MouseEvent('mousemove', mInit));
     } else if (type === 'keydown') {
       el.dispatchEvent(new KeyboardEvent('keydown', kInit));
-      if (key && key.length === 1) {
-        const active = document.activeElement;
-        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-          const proto = active.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-          if (setter) {
-            setter.call(active, active.value + key);
-            active.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        }
-      } else if (key === 'Backspace') {
-        const active = document.activeElement;
-        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-          const proto = active.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-          if (setter) {
+      const active = document.activeElement;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+        const proto = active.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) {
+          if (key === 'Backspace') {
             setter.call(active, active.value.slice(0, -1));
-            active.dispatchEvent(new Event('input', { bubbles: true }));
+          } else if (key.length === 1) {
+            setter.call(active, active.value + key);
           }
+          active.dispatchEvent(new Event('input', { bubbles: true }));
         }
       }
     } else if (type === 'keyup') {
@@ -108,25 +122,40 @@ export function useHost({ localVideoRef }) {
 
   useEffect(() => {
     const socket = getSocket();
+
     socket.on('user-joined', async (viewer) => {
+      console.log('[Host] user-joined:', viewer.id);
       addViewer(viewer);
-      if (localStream.current) await createConnectionForViewer(viewer.id);
+      // Only create WebRTC connection if we're already sharing
+      if (localStream.current) {
+        // Small delay to ensure viewer's socket listeners are registered
+        setTimeout(() => createConnectionForViewer(viewer.id), 300);
+      }
     });
+
     socket.on('user-left', ({ id }) => {
       removeViewer(id);
       if (peerConnections.current[id]) {
-        peerConnections.current[id].close();
+        peerConnections.current[id].pc.close();
         delete peerConnections.current[id];
       }
     });
+
     socket.on('webrtc-answer', async ({ fromId, answer }) => {
-      const pc = peerConnections.current[fromId];
-      if (pc) await handleAnswer(pc, answer);
+      console.log('[Host] Got answer from', fromId);
+      const entry = peerConnections.current[fromId];
+      if (entry) {
+        await handleAnswer(entry.pc, answer);
+        // Flush any ICE candidates that were queued before answer arrived
+        await entry.iceQueue.flush();
+      }
     });
+
     socket.on('ice-candidate', async ({ fromId, candidate }) => {
-      const pc = peerConnections.current[fromId];
-      if (pc) await addIceCandidate(pc, candidate);
+      const entry = peerConnections.current[fromId];
+      if (entry) await entry.iceQueue.add(candidate);
     });
+
     socket.on('control-event', replayControlEvent);
     socket.on('control-toggled', ({ enabled }) => setControlEnabled(enabled));
 
@@ -145,5 +174,17 @@ export function useHost({ localVideoRef }) {
     setControlEnabled(enabled);
   }, [setControlEnabled]);
 
-  return { startScreenShare, stopScreenShare, toggleControl };
+  // When host starts sharing AFTER viewers are already in the session,
+  // we need to create connections for all existing viewers
+  const startShareAndConnect = useCallback(async () => {
+    const stream = await startScreenShare();
+    const { viewers } = useSessionStore.getState();
+    console.log('[Host] Starting share, existing viewers:', viewers.length);
+    for (const viewer of viewers) {
+      setTimeout(() => createConnectionForViewer(viewer.id), 300);
+    }
+    return stream;
+  }, [startScreenShare, createConnectionForViewer]);
+
+  return { startScreenShare: startShareAndConnect, stopScreenShare, toggleControl };
 }
